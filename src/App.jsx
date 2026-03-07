@@ -1,214 +1,202 @@
 import { useMemo, useState } from "react";
-import { transactions, getMonth, formatMonth, formatCurrency } from "./data/transactions";
-import KPICard from "./components/KPICard";
-import MonthlyChart from "./components/MonthlyChart";
-import CategoryDonut from "./components/CategoryDonut";
-import TeamPaymentsChart from "./components/TeamPaymentsChart";
-import BalanceChart from "./components/BalanceChart";
+import { useSheetData } from "./hooks/useSheetData";
+import { fmt, getYearMonth, formatYearMonth, byMonth, groupSum, teamName, serviceType, normalizeDate } from "./utils/finance";
+import LoadingScreen    from "./components/LoadingScreen";
+import ErrorScreen      from "./components/ErrorScreen";
+import KPICard          from "./components/KPICard";
+import MonthlyChart     from "./components/MonthlyChart";
+import DonutChart       from "./components/DonutChart";
+import TeamChart        from "./components/TeamChart";
+import BalanceChart     from "./components/BalanceChart";
 import ServiceTypeChart from "./components/ServiceTypeChart";
+import TopClients       from "./components/TopClients";
 import TransactionTable from "./components/TransactionTable";
 
-const ALL_MONTHS = [...new Set(transactions.map((t) => getMonth(t.transactionDate)))].sort();
-
 export default function App() {
-  const [selectedMonth, setSelectedMonth] = useState("All");
+  const { transactions, loading, error, refresh, lastFetched } = useSheetData();
+  const [monthFilter, setMonthFilter] = useState("All");
 
-  const filtered = useMemo(() => {
-    if (selectedMonth === "All") return transactions;
-    return transactions.filter((t) => getMonth(t.transactionDate) === selectedMonth);
-  }, [selectedMonth]);
+  // ── All months present in data ──────────────────────────────────────────────
+  const allMonths = useMemo(() =>
+    [...new Set(transactions.map(t => getYearMonth(t.transactionDate)).filter(Boolean))].sort(),
+    [transactions]
+  );
 
-  // KPI calculations
-  const { totalRevenue, totalExpenses, netIncome, currentBalance, txCount } = useMemo(() => {
-    const revenue = filtered.filter((t) => t.type === "Revenue").reduce((s, t) => s + Math.abs(t.amount), 0);
-    const expenses = filtered.filter((t) => t.type === "Expense").reduce((s, t) => s + Math.abs(t.amount), 0);
-    const sorted = [...filtered].sort((a, b) => a.bankDate.localeCompare(b.bankDate));
-    const bal = sorted.length ? sorted[sorted.length - 1].balance : 0;
-    return { totalRevenue: revenue, totalExpenses: expenses, netIncome: revenue - expenses, currentBalance: bal, txCount: filtered.length };
+  // ── Filtered set ────────────────────────────────────────────────────────────
+  const filtered = useMemo(() =>
+    monthFilter === "All" ? transactions : transactions.filter(t => getYearMonth(t.transactionDate) === monthFilter),
+    [transactions, monthFilter]
+  );
+
+  // ── KPIs ────────────────────────────────────────────────────────────────────
+  const kpis = useMemo(() => {
+    const revenue  = filtered.filter(t => t.type === "Revenue").reduce((s, t) => s + Math.abs(t.amount), 0);
+    const expenses = filtered.filter(t => t.type === "Expense").reduce((s, t) => s + Math.abs(t.amount), 0);
+    const net      = revenue - expenses;
+    const sorted   = [...filtered].filter(t => t.balance).sort((a, b) => normalizeDate(a.bankDate).localeCompare(normalizeDate(b.bankDate)));
+    const balance  = sorted.at(-1)?.balance ?? 0;
+    const margin   = revenue > 0 ? ((net / revenue) * 100).toFixed(1) : "0";
+    return { revenue, expenses, net, balance, margin, count: filtered.length };
   }, [filtered]);
 
-  // Monthly bar chart data
-  const monthlyData = useMemo(() => {
-    return ALL_MONTHS.map((m) => {
-      const tx = transactions.filter((t) => getMonth(t.transactionDate) === m);
-      return {
-        month: formatMonth(m),
-        revenue: tx.filter((t) => t.type === "Revenue").reduce((s, t) => s + Math.abs(t.amount), 0),
-        expenses: tx.filter((t) => t.type === "Expense").reduce((s, t) => s + Math.abs(t.amount), 0),
-      };
-    });
-  }, []);
+  // ── Monthly chart ────────────────────────────────────────────────────────────
+  const monthlyData = useMemo(() => byMonth(transactions), [transactions]);
 
-  // Revenue by category donut
-  const revByCat = useMemo(() => {
-    const map = {};
-    filtered.filter((t) => t.type === "Revenue").forEach((t) => {
-      map[t.category] = (map[t.category] || 0) + t.amount;
+  // ── Revenue by category ──────────────────────────────────────────────────────
+  const revByCat = useMemo(() =>
+    groupSum(filtered, t => t.category, t => t.type === "Revenue"),
+    [filtered]
+  );
+
+  // ── Expense by category ──────────────────────────────────────────────────────
+  const expByCat = useMemo(() =>
+    groupSum(filtered, t => t.category, t => t.type === "Expense"),
+    [filtered]
+  );
+
+  // ── Team payments (all-time, unaffected by month filter) ────────────────────
+  const teamData = useMemo(() =>
+    groupSum(transactions, t => teamName(t.description), t => t.category === "Labor"),
+    [transactions]
+  );
+
+  // ── Running balance ──────────────────────────────────────────────────────────
+  const balanceData = useMemo(() =>
+    [...transactions]
+      .filter(t => t.balance && t.bankDate)
+      .sort((a, b) => normalizeDate(a.bankDate).localeCompare(normalizeDate(b.bankDate)))
+      .map(t => ({ label: t.bankDate, balance: t.balance })),
+    [transactions]
+  );
+
+  // ── Service type stacked chart ───────────────────────────────────────────────
+  const serviceData = useMemo(() => {
+    const monthMap = {};
+    allMonths.forEach(m => {
+      monthMap[m] = { month: formatYearMonth(m), Build: 0, Consulting: 0, "Continued Support": 0, Other: 0 };
     });
-    return Object.entries(map).map(([name, value]) => ({ name, value: Math.round(value * 100) / 100 }))
-      .sort((a, b) => b.value - a.value);
+    transactions.filter(t => t.category === "Sales" && t.type === "Revenue").forEach(t => {
+      const m = getYearMonth(t.transactionDate);
+      if (monthMap[m]) monthMap[m][serviceType(t.notes)] += Math.abs(t.amount);
+    });
+    return Object.values(monthMap);
+  }, [transactions, allMonths]);
+
+  // ── Top clients ──────────────────────────────────────────────────────────────
+  const topClients = useMemo(() =>
+    groupSum(filtered, t => t.description, t => t.category === "Sales" && t.type === "Revenue").slice(0, 8),
+    [filtered]
+  );
+
+  // ── Revenue stream cards ─────────────────────────────────────────────────────
+  const streams = useMemo(() => {
+    const recurring  = filtered.filter(t => t.notes === "Continued Support" && t.type === "Revenue").reduce((s, t) => s + t.amount, 0);
+    const project    = filtered.filter(t => ["Build", "Consulting"].includes(t.notes) && t.type === "Revenue").reduce((s, t) => s + t.amount, 0);
+    const affiliate  = filtered.filter(t => ["Affiliate", "Referral"].includes(t.category) && t.type === "Revenue").reduce((s, t) => s + t.amount, 0);
+    const lto        = filtered.filter(t => t.category === "LTO" && t.type === "Revenue").reduce((s, t) => s + t.amount, 0);
+    return { recurring, project, affiliate, lto };
   }, [filtered]);
 
-  // Expense by category donut
-  const expByCat = useMemo(() => {
-    const map = {};
-    filtered.filter((t) => t.type === "Expense").forEach((t) => {
-      map[t.category] = (map[t.category] || 0) + t.amount;
-    });
-    return Object.entries(map).map(([name, value]) => ({ name, value: Math.round(value * 100) / 100 }))
-      .sort((a, b) => b.value - a.value);
-  }, [filtered]);
-
-  // Team payments (always all-time for full picture)
-  const teamPayments = useMemo(() => {
-    const map = {};
-    transactions.filter((t) => t.category === "Labor").forEach((t) => {
-      let name = t.description;
-      if (name.startsWith("Team Payment - ")) name = name.replace("Team Payment - ", "");
-      else if (name.startsWith("Outside Service - ")) name = name.replace("Outside Service - ", "") + " (Contractor)";
-      map[name] = (map[name] || 0) + t.amount;
-    });
-    return Object.entries(map)
-      .map(([name, total]) => ({ name, total: Math.round(total * 100) / 100 }))
-      .sort((a, b) => b.total - a.total);
-  }, []);
-
-  // Balance over time
-  const balanceData = useMemo(() => {
-    return [...transactions]
-      .sort((a, b) => a.bankDate.localeCompare(b.bankDate))
-      .map((t) => ({
-        date: t.bankDate.slice(5),
-        balance: t.balance,
-      }));
-  }, []);
-
-  // Service type stacked bar
-  const serviceTypeData = useMemo(() => {
-    return ALL_MONTHS.map((m) => {
-      const tx = transactions.filter((t) => getMonth(t.transactionDate) === m && t.category === "Sales");
-      const result = { month: formatMonth(m), Build: 0, Consulting: 0, "Continued Support": 0, Other: 0 };
-      tx.forEach((t) => {
-        const key = ["Build", "Consulting", "Continued Support"].includes(t.notes) ? t.notes : "Other";
-        result[key] += t.amount;
-      });
-      return result;
-    });
-  }, []);
-
-  // Top clients
-  const topClients = useMemo(() => {
-    const map = {};
-    filtered.filter((t) => t.type === "Revenue" && t.category === "Sales").forEach((t) => {
-      map[t.description] = (map[t.description] || 0) + t.amount;
-    });
-    return Object.entries(map)
-      .map(([name, total]) => ({ name, total }))
-      .sort((a, b) => b.total - a.total)
-      .slice(0, 8);
-  }, [filtered]);
-
-  const margin = totalRevenue > 0 ? ((netIncome / totalRevenue) * 100).toFixed(1) : "0";
+  // ── Render states ────────────────────────────────────────────────────────────
+  if (loading) return <LoadingScreen />;
+  if (error)   return <ErrorScreen error={error} onRetry={refresh} />;
 
   return (
-    <div className="min-h-screen bg-gray-50 font-sans">
-      {/* Header */}
-      <header className="bg-white border-b border-gray-200 px-6 py-4 sticky top-0 z-10">
-        <div className="max-w-7xl mx-auto flex flex-wrap items-center justify-between gap-4">
-          <div>
-            <h1 className="text-xl font-bold text-gray-900">Financial Dashboard</h1>
-            <p className="text-xs text-gray-400 mt-0.5">Dec 2025 – Mar 2026 · {transactions.length} transactions</p>
+    <div className="min-h-screen bg-gray-50">
+      {/* ── Header ─────────────────────────────────────────────────────────── */}
+      <header className="bg-white border-b border-gray-200 px-6 py-4 sticky top-0 z-20">
+        <div className="max-w-7xl mx-auto flex flex-wrap items-center gap-4">
+          <div className="flex-1 min-w-0">
+            <h1 className="text-xl font-bold text-gray-900 leading-tight">Financial Dashboard</h1>
+            <p className="text-xs text-gray-400 mt-0.5">
+              Live from Google Sheets · {transactions.length} transactions
+              {lastFetched && ` · Updated ${lastFetched.toLocaleTimeString()}`}
+            </p>
           </div>
           <div className="flex items-center gap-2">
-            <span className="text-xs text-gray-500 font-medium">Period:</span>
+            <label className="text-xs text-gray-500 font-medium whitespace-nowrap">Period:</label>
             <select
               className="border border-gray-200 rounded-lg px-3 py-1.5 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-indigo-200"
-              value={selectedMonth}
-              onChange={(e) => setSelectedMonth(e.target.value)}
+              value={monthFilter}
+              onChange={e => setMonthFilter(e.target.value)}
             >
               <option value="All">All Time</option>
-              {ALL_MONTHS.map((m) => (
-                <option key={m} value={m}>{formatMonth(m)}</option>
-              ))}
+              {allMonths.map(m => <option key={m} value={m}>{formatYearMonth(m)}</option>)}
             </select>
+            <button
+              onClick={refresh}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-sm border border-gray-200 rounded-lg text-gray-600 hover:bg-gray-50 hover:border-gray-300 transition-colors"
+              title="Refresh data from Google Sheets"
+            >
+              ↻ Refresh
+            </button>
           </div>
         </div>
       </header>
 
       <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-6">
 
-        {/* KPI Cards */}
-        <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4">
-          <KPICard title="Total Revenue" value={formatCurrency(totalRevenue)} subtitle={`${txCount} transactions`} color="green" icon="↑" />
-          <KPICard title="Total Expenses" value={formatCurrency(totalExpenses)} color="red" icon="↓" />
-          <KPICard title="Net Income" value={formatCurrency(netIncome)} subtitle={`${margin}% margin`} color={netIncome >= 0 ? "blue" : "red"} icon="=" />
-          <KPICard title="Bank Balance" value={formatCurrency(currentBalance)} subtitle="Latest balance" color="purple" icon="$" />
-          <KPICard title="Transactions" value={txCount} subtitle={selectedMonth === "All" ? "All time" : formatMonth(selectedMonth)} color="amber" icon="#" />
+        {/* ── KPI cards ───────────────────────────────────────────────────── */}
+        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
+          <KPICard title="Total Revenue"  value={fmt(kpis.revenue)}  subtitle={`${kpis.count} transactions`} color="green"  icon="📈" />
+          <KPICard title="Total Expenses" value={fmt(kpis.expenses)} color="red"    icon="📉" />
+          <KPICard title="Net Income"     value={fmt(kpis.net)}      subtitle={`${kpis.margin}% margin`}     color={kpis.net >= 0 ? "blue" : "red"} icon="💰" />
+          <KPICard title="Bank Balance"   value={fmt(kpis.balance)}  subtitle="Latest balance"               color="purple" icon="🏦" />
+          <KPICard title="Transactions"   value={kpis.count}         subtitle={monthFilter === "All" ? "All time" : formatYearMonth(monthFilter)} color="amber" icon="📋" />
         </div>
 
-        {/* Monthly Revenue vs Expenses */}
+        {/* ── Monthly bar chart ────────────────────────────────────────────── */}
         <MonthlyChart data={monthlyData} />
 
-        {/* Donut charts */}
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-          <CategoryDonut data={revByCat} title="Revenue by Category" />
-          <CategoryDonut data={expByCat} title="Expenses by Category" />
+        {/* ── Revenue / Expense donuts ─────────────────────────────────────── */}
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
+          <DonutChart data={revByCat} title="Revenue by Category" />
+          <DonutChart data={expByCat} title="Expenses by Category" />
         </div>
 
-        {/* Service type + team */}
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-          <ServiceTypeChart data={serviceTypeData} />
-          <TeamPaymentsChart data={teamPayments} />
+        {/* ── Service type + team payments ─────────────────────────────────── */}
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
+          <ServiceTypeChart data={serviceData} />
+          <TeamChart data={teamData} />
         </div>
 
-        {/* Balance chart + top clients */}
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-          <BalanceChart data={balanceData} />
-
-          {/* Top clients */}
-          <div className="bg-white rounded-xl border border-gray-200 p-5">
-            <h2 className="text-sm font-semibold uppercase tracking-widest text-gray-500 mb-4">Top Clients by Revenue</h2>
-            <div className="space-y-2">
-              {topClients.map(({ name, total }, i) => {
-                const max = topClients[0].total;
-                const pct = (total / max) * 100;
-                return (
-                  <div key={i}>
-                    <div className="flex justify-between text-sm mb-1">
-                      <span className="text-gray-700 truncate max-w-xs">{name}</span>
-                      <span className="text-gray-800 font-semibold ml-2 whitespace-nowrap">{formatCurrency(total)}</span>
-                    </div>
-                    <div className="h-1.5 bg-gray-100 rounded-full overflow-hidden">
-                      <div className="h-full bg-purple-400 rounded-full" style={{ width: `${pct}%` }} />
-                    </div>
-                  </div>
-                );
-              })}
-              {topClients.length === 0 && <p className="text-gray-400 text-sm">No sales data for selected period.</p>}
-            </div>
-          </div>
+        {/* ── Balance chart + top clients ──────────────────────────────────── */}
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
+          {balanceData.length > 0 && <BalanceChart data={balanceData} />}
+          <TopClients data={topClients} />
         </div>
 
-        {/* Revenue stream breakdown */}
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+        {/* ── Revenue stream breakdown ─────────────────────────────────────── */}
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
           {[
-            { label: "Recurring Revenue", desc: "Continued Support clients", value: filtered.filter(t => t.notes === "Continued Support").reduce((s, t) => s + t.amount, 0), color: "text-emerald-600" },
-            { label: "Project Revenue", desc: "Build & Consulting", value: filtered.filter(t => ["Build", "Consulting"].includes(t.notes)).reduce((s, t) => s + t.amount, 0), color: "text-indigo-600" },
-            { label: "Affiliate & Referral", desc: "Whop, Close, PartnerStack, etc.", value: filtered.filter(t => ["Affiliate", "Referral"].includes(t.category) && t.type === "Revenue").reduce((s, t) => s + t.amount, 0), color: "text-amber-600" },
-          ].map(({ label, desc, value, color }) => (
-            <div key={label} className="bg-white rounded-xl border border-gray-200 p-5">
-              <p className="text-xs text-gray-500 font-semibold uppercase tracking-widest">{label}</p>
-              <p className={`text-2xl font-bold mt-1 ${color}`}>{formatCurrency(value)}</p>
-              <p className="text-xs text-gray-400 mt-1">{desc}</p>
-            </div>
-          ))}
+            { label: "LTO Revenue",        desc: "Low-ticket offers",            value: streams.lto,       color: "indigo" },
+            { label: "Project Revenue",    desc: "Build + Consulting",           value: streams.project,   color: "purple" },
+            { label: "Recurring Revenue",  desc: "Continued Support retainers",  value: streams.recurring, color: "green"  },
+            { label: "Affiliate / Referral", desc: "Whop, Close, PartnerStack",  value: streams.affiliate, color: "amber"  },
+          ].map(({ label, desc, value, color }) => {
+            const pct = kpis.revenue > 0 ? ((value / kpis.revenue) * 100).toFixed(1) : "0";
+            const colorMap = {
+              indigo: { bg: "bg-indigo-50", border: "border-indigo-200", text: "text-indigo-700", sub: "text-indigo-400" },
+              purple: { bg: "bg-purple-50", border: "border-purple-200", text: "text-purple-700", sub: "text-purple-400" },
+              green:  { bg: "bg-emerald-50", border: "border-emerald-200", text: "text-emerald-700", sub: "text-emerald-400" },
+              amber:  { bg: "bg-amber-50", border: "border-amber-200", text: "text-amber-700", sub: "text-amber-400" },
+            }[color];
+            return (
+              <div key={label} className={`rounded-xl border ${colorMap.border} ${colorMap.bg} p-4`}>
+                <p className="text-[11px] font-semibold uppercase tracking-widest text-gray-500">{label}</p>
+                <p className={`text-xl font-bold mt-1 ${colorMap.text}`}>{fmt(value)}</p>
+                <p className={`text-xs mt-0.5 ${colorMap.sub}`}>{pct}% of revenue</p>
+                <p className="text-[11px] text-gray-400 mt-1">{desc}</p>
+              </div>
+            );
+          })}
         </div>
 
-        {/* Transaction table */}
+        {/* ── Transaction table ────────────────────────────────────────────── */}
         <TransactionTable transactions={filtered} />
 
         <footer className="text-center text-xs text-gray-300 pb-4">
-          Financial data through {new Date().toLocaleDateString("en-US", { month: "long", year: "numeric" })}
+          Data pulled live from Google Sheets · Spreadsheet ID: {import.meta.env.VITE_SPREADSHEET_ID || "1N3D-jywleiBhsxByuK-Mq17sJpFIZYvo3Is4RmxkLkg"}
         </footer>
       </main>
     </div>
