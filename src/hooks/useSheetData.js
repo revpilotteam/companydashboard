@@ -147,11 +147,11 @@ export function useSheetData() {
         }
       }
 
-      // Step 4 — auto-discover and load extra tabs (master transactions, software payments)
+      // Step 4 — load ALL remaining tabs (every tab not already loaded as primary or meta)
       const loadedNames = new Set([txSheetName, metaSheetName].filter(Boolean));
       const extraSheets = sheetsInfo
         .map(s => ({ name: s.properties?.title || "" }))
-        .filter(({ name }) => !loadedNames.has(name) && classifyTab(name) !== null);
+        .filter(({ name }) => name && !loadedNames.has(name));
 
       const extraResults = await Promise.allSettled(
         extraSheets.map(async ({ name }) => {
