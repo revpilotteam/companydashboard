@@ -255,6 +255,7 @@ export default function App() {
 
         <ChatBot
           transactions={filtered}
+          allTransactions={transactions}
           kpis={kpis}
           streams={streams}
           periodLabel={periodLabel}

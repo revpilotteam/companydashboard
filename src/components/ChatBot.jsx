@@ -4,59 +4,91 @@ import { fmt, byMonth, groupSum, teamName } from "../utils/finance";
 
 const API_KEY = import.meta.env.VITE_ANTHROPIC_API_KEY;
 
-function buildDataContext(transactions, kpis, streams, periodLabel) {
-  const revenue = transactions.filter(t => t.type === "Revenue");
-  const expenses = transactions.filter(t => t.type === "Expense");
+function buildDataContext(transactions, allTransactions, kpis, streams, periodLabel) {
+  // Use allTransactions for full-history analysis, filtered transactions for current period KPIs
+  const all = allTransactions && allTransactions.length > 0 ? allTransactions : transactions;
 
-  const revByCat = groupSum(transactions, t => t.category, t => t.type === "Revenue");
-  const expByCat = groupSum(transactions, t => t.category, t => t.type === "Expense");
-  const teamData = groupSum(transactions, t => teamName(t.description), t => t.category === "Labor");
-  const topClients = groupSum(transactions, t => t.description, t => t.category === "Sales" && t.type === "Revenue").slice(0, 10);
-  const monthly = byMonth(transactions);
+  const allRevByCat  = groupSum(all, t => t.category, t => t.type === "Revenue");
+  const allExpByCat  = groupSum(all, t => t.category, t => t.type === "Expense");
+  const allTeamData  = groupSum(all, t => teamName(t.description), t => t.category === "Labor");
+  const allTopClients = groupSum(all, t => t.description, t => t.category === "Sales" && t.type === "Revenue").slice(0, 20);
+  const allMonthly   = byMonth(all);
 
-  const recentTx = [...transactions]
+  const allRevenue  = all.filter(t => t.type === "Revenue").reduce((s, t) => s + Math.abs(t.amount), 0);
+  const allExpenses = all.filter(t => t.type === "Expense").reduce((s, t) => s + Math.abs(t.amount), 0);
+
+  // Build per-tab source summary
+  const tabSources = [...new Set(all.map(t => t.source).filter(Boolean))];
+  const tabSummaries = tabSources.map(src => {
+    const tabTxs = all.filter(t => t.source === src);
+    const rev = tabTxs.filter(t => t.type === "Revenue").reduce((s, t) => s + Math.abs(t.amount), 0);
+    const exp = tabTxs.filter(t => t.type === "Expense").reduce((s, t) => s + Math.abs(t.amount), 0);
+    return `  - "${src}": ${tabTxs.length} rows | Revenue ${fmt(rev)} | Expenses ${fmt(exp)}`;
+  });
+
+  // All transactions sorted by date (no cap — full dataset)
+  const allTxLines = [...all]
     .sort((a, b) => String(b.transactionDate).localeCompare(String(a.transactionDate)))
-    .slice(0, 20)
-    .map(t => `  - ${t.transactionDate}: ${t.type} | ${t.category} | ${t.description} | ${fmt(t.amount)}${t.notes ? ` | Notes: ${t.notes}` : ""}`);
+    .map(t => `  ${t.transactionDate} | ${t.type} | ${t.category} | ${t.description} | ${fmt(t.amount)}${t.source ? ` | [${t.source}]` : ""}${t.notes ? ` | ${t.notes}` : ""}`);
 
-  return `You are a financial analyst assistant for this company dashboard.
-Current period filter: ${periodLabel}
-Total transactions in view: ${kpis.count}
+  const isPeriodFiltered = periodLabel !== "All time";
 
-## Key Financial Metrics
-- Total Revenue: ${fmt(kpis.revenue)}
-- Total Expenses: ${fmt(kpis.expenses)}
-- Net Income: ${fmt(kpis.net)} (${kpis.margin}% margin)
+  let periodSection = "";
+  if (isPeriodFiltered) {
+    const pRevByCat  = groupSum(transactions, t => t.category, t => t.type === "Revenue");
+    const pExpByCat  = groupSum(transactions, t => t.category, t => t.type === "Expense");
+    periodSection = `
+## Current Period: ${periodLabel} (dashboard filter active)
+- Revenue: ${fmt(kpis.revenue)} | Expenses: ${fmt(kpis.expenses)} | Net: ${fmt(kpis.net)} (${kpis.margin}% margin)
+- Transactions: ${kpis.count}
+### Period Revenue by Category
+${pRevByCat.map(c => `  - ${c.name}: ${fmt(c.value)}`).join("\n") || "  (none)"}
+### Period Expenses by Category
+${pExpByCat.map(c => `  - ${c.name}: ${fmt(c.value)}`).join("\n") || "  (none)"}`;
+  }
+
+  return `You are a financial analyst assistant with access to ALL data from every tab of this company's spreadsheet.
+Total transactions loaded: ${all.length} (across all tabs and all time)
+Dashboard period filter: ${periodLabel}
+
+## Spreadsheet Tabs Summary
+${tabSummaries.join("\n") || "  (single sheet)"}
+
+## All-Time Totals
+- Total Revenue: ${fmt(allRevenue)}
+- Total Expenses: ${fmt(allExpenses)}
+- Net Income: ${fmt(allRevenue - allExpenses)}
 - Bank Balance (latest): ${fmt(kpis.balance)}
+${periodSection}
 
-## Revenue Streams
-- LTO Revenue (low-ticket offers): ${fmt(streams.lto)} (${kpis.revenue > 0 ? ((streams.lto / kpis.revenue) * 100).toFixed(1) : 0}%)
-- Project Revenue (Build + Consulting): ${fmt(streams.project)} (${kpis.revenue > 0 ? ((streams.project / kpis.revenue) * 100).toFixed(1) : 0}%)
-- Recurring Revenue (Continued Support): ${fmt(streams.recurring)} (${kpis.revenue > 0 ? ((streams.recurring / kpis.revenue) * 100).toFixed(1) : 0}%)
-- Affiliate / Referral: ${fmt(streams.affiliate)} (${kpis.revenue > 0 ? ((streams.affiliate / kpis.revenue) * 100).toFixed(1) : 0}%)
+## All-Time Revenue by Category
+${allRevByCat.map(c => `  - ${c.name}: ${fmt(c.value)}`).join("\n") || "  (none)"}
 
-## Revenue by Category
-${revByCat.map(c => `  - ${c.name}: ${fmt(c.value)}`).join("\n") || "  (none)"}
+## All-Time Expenses by Category
+${allExpByCat.map(c => `  - ${c.name}: ${fmt(c.value)}`).join("\n") || "  (none)"}
 
-## Expenses by Category
-${expByCat.map(c => `  - ${c.name}: ${fmt(c.value)}`).join("\n") || "  (none)"}
+## Top Clients All Time (by Revenue)
+${allTopClients.map((c, i) => `  ${i + 1}. ${c.name}: ${fmt(c.value)}`).join("\n") || "  (none)"}
 
-## Top Clients by Revenue
-${topClients.map((c, i) => `  ${i + 1}. ${c.name}: ${fmt(c.value)}`).join("\n") || "  (none)"}
+## Team & Contractor Payments All Time
+${allTeamData.map(c => `  - ${c.name}: ${fmt(c.value)}`).join("\n") || "  (none)"}
 
-## Team & Contractor Payments
-${teamData.map(c => `  - ${c.name}: ${fmt(c.value)}`).join("\n") || "  (none)"}
+## Revenue Streams (All Time)
+- LTO Revenue (low-ticket offers): ${fmt(streams.lto)}
+- Project Revenue (Build + Consulting): ${fmt(streams.project)}
+- Recurring Revenue (Continued Support): ${fmt(streams.recurring)}
+- Affiliate / Referral: ${fmt(streams.affiliate)}
 
-## Monthly Revenue vs Expenses
-${monthly.map(m => `  - ${m.month}: Revenue ${fmt(m.revenue)}, Expenses ${fmt(m.expenses)}, Net ${fmt(m.net)}`).join("\n") || "  (none)"}
+## Monthly History (All Time)
+${allMonthly.map(m => `  - ${m.month}: Revenue ${fmt(m.revenue)}, Expenses ${fmt(m.expenses)}, Net ${fmt(m.net)}`).join("\n") || "  (none)"}
 
-## 20 Most Recent Transactions
-${recentTx.join("\n") || "  (none)"}
+## All Transactions (newest first)
+${allTxLines.join("\n") || "  (none)"}
 
-Answer questions concisely and accurately using the data above. Use dollar amounts, percentages, and comparisons where helpful. If asked something not covered by the data, say so honestly.`;
+Answer questions using the full dataset above. You have access to every transaction from every tab. Use exact figures, percentages, and month-by-month comparisons. If the user asks about a specific period, filter from the data above.`;
 }
 
-export default function ChatBot({ transactions, kpis, streams, periodLabel }) {
+export default function ChatBot({ transactions, allTransactions, kpis, streams, periodLabel }) {
   const [open, setOpen] = useState(false);
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState("");
@@ -99,7 +131,7 @@ export default function ChatBot({ transactions, kpis, streams, periodLabel }) {
 
     try {
       const client = new Anthropic({ apiKey: API_KEY, dangerouslyAllowBrowser: true });
-      const systemPrompt = buildDataContext(transactions, kpis, streams, periodLabel);
+      const systemPrompt = buildDataContext(transactions, allTransactions, kpis, streams, periodLabel);
 
       const apiMessages = updatedHistory.map(m => ({ role: m.role, content: m.content }));
 
@@ -134,7 +166,7 @@ export default function ChatBot({ transactions, kpis, streams, periodLabel }) {
     } finally {
       setStreaming(false);
     }
-  }, [input, streaming, messages, transactions, kpis, streams, periodLabel]);
+  }, [input, streaming, messages, transactions, allTransactions, kpis, streams, periodLabel]);
 
   const handleKeyDown = (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -168,7 +200,7 @@ export default function ChatBot({ transactions, kpis, streams, periodLabel }) {
           <div className="flex items-center justify-between px-4 py-3 bg-indigo-600 text-white">
             <div>
               <p className="font-semibold text-sm">Claude — Financial Analyst</p>
-              <p className="text-[11px] text-indigo-200">Ask anything about your dashboard data</p>
+              <p className="text-[11px] text-indigo-200">Full spreadsheet access · all tabs · all time</p>
             </div>
             <button
               onClick={clearChat}
