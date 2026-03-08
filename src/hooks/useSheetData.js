@@ -57,14 +57,49 @@ function parseTransaction(raw) {
   };
 }
 
+/**
+ * More flexible parser for extra tabs with non-standard column names.
+ * Handles common variations seen in master transaction and software payment sheets.
+ */
+function parseExtraTransaction(raw, tabType) {
+  const tx = {
+    transactionDate: pick(raw, "transaction date", "trans date", "date", "payment date", "billing date", "renewal date"),
+    bankDate:        pick(raw, "bank date"),
+    category:        pick(raw, "category"),
+    amount:          parseAmount(pick(raw, "amount", "cost", "charge", "price", "total")),
+    type:            pick(raw, "type"),
+    description:     pick(raw, "description", "name", "vendor", "software", "tool", "service", "item", "payee", "merchant"),
+    balance:         parseAmount(pick(raw, "balance", "running balance")),
+    notes:           pick(raw, "notes", "billing cycle", "frequency", "memo", "comment"),
+  };
+  // Apply defaults based on tab classification
+  if (tabType === "software") {
+    if (!tx.type)     tx.type     = "Expense";
+    if (!tx.category) tx.category = "Software";
+  }
+  return tx;
+}
+
+/**
+ * Classify a tab by its name. Returns "software", "master", or null.
+ * Used to decide which extra tabs to load and how to parse them.
+ */
+function classifyTab(name) {
+  const lower = name.toLowerCase();
+  if (lower.includes("software") || lower.includes("saas")) return "software";
+  if (lower.includes("master") || lower.includes("all transaction")) return "master";
+  return null;
+}
+
 // ── Hook ─────────────────────────────────────────────────────────────────────
 
 export function useSheetData() {
-  const [transactions, setTransactions] = useState([]);
-  const [meta,         setMeta]         = useState([]);
-  const [loading,      setLoading]      = useState(true);
-  const [error,        setError]        = useState(null);
-  const [lastFetched,  setLastFetched]  = useState(null);
+  const [transactions,  setTransactions]  = useState([]);
+  const [meta,          setMeta]          = useState([]);
+  const [sheetSources,  setSheetSources]  = useState([]);
+  const [loading,       setLoading]       = useState(true);
+  const [error,         setError]         = useState(null);
+  const [lastFetched,   setLastFetched]   = useState(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -91,7 +126,7 @@ export function useSheetData() {
 
       if (!txSheetName) throw new Error("No sheets found in the spreadsheet.");
 
-      // Step 2 — fetch transaction sheet
+      // Step 2 — fetch primary transaction sheet
       const txData = await apiFetch(
         `${BASE}/values/${encodeURIComponent(txSheetName)}?key=${API_KEY}&valueRenderOption=UNFORMATTED_VALUE&dateTimeRenderOption=FORMATTED_STRING`
       );
@@ -99,8 +134,6 @@ export function useSheetData() {
       const parsed = rowsToObjects(rows)
         .map(parseTransaction)
         .filter(t => t.transactionDate && (t.amount !== 0 || t.type));
-
-      setTransactions(parsed);
 
       // Step 3 — fetch second sheet (categories/summary) if it exists
       if (metaSheetName && metaSheetName !== txSheetName) {
@@ -114,6 +147,49 @@ export function useSheetData() {
         }
       }
 
+      // Step 4 — auto-discover and load extra tabs (master transactions, software payments)
+      const loadedNames = new Set([txSheetName, metaSheetName].filter(Boolean));
+      const extraSheets = sheetsInfo
+        .map(s => ({ name: s.properties?.title || "" }))
+        .filter(({ name }) => !loadedNames.has(name) && classifyTab(name) !== null);
+
+      const extraResults = await Promise.allSettled(
+        extraSheets.map(async ({ name }) => {
+          const tabType = classifyTab(name);
+          const data = await apiFetch(
+            `${BASE}/values/${encodeURIComponent(name)}?key=${API_KEY}&valueRenderOption=UNFORMATTED_VALUE&dateTimeRenderOption=FORMATTED_STRING`
+          );
+          const sheetRows = data.values || [];
+          const headers = sheetRows[0] || [];
+          const txs = rowsToObjects(sheetRows)
+            .map(raw => ({ ...parseExtraTransaction(raw, tabType), source: name }))
+            .filter(t => t.transactionDate && (t.amount !== 0 || t.type));
+          return { name, tabType, headers, count: txs.length, transactions: txs };
+        })
+      );
+
+      const extraTxs = extraResults
+        .filter(r => r.status === "fulfilled")
+        .flatMap(r => r.value.transactions);
+
+      // Build sources list for display in the UI
+      const sources = [
+        { name: txSheetName, tabType: "primary", count: parsed.length },
+        ...extraResults
+          .filter(r => r.status === "fulfilled")
+          .map(r => ({
+            name:     r.value.name,
+            tabType:  r.value.tabType,
+            count:    r.value.count,
+            headers:  r.value.headers,
+          })),
+      ];
+
+      setTransactions([
+        ...parsed.map(t => ({ ...t, source: txSheetName })),
+        ...extraTxs,
+      ]);
+      setSheetSources(sources);
       setLastFetched(new Date());
     } catch (e) {
       setError(e.message);
@@ -124,5 +200,5 @@ export function useSheetData() {
 
   useEffect(() => { load(); }, [load]);
 
-  return { transactions, meta, loading, error, refresh: load, lastFetched };
+  return { transactions, meta, sheetSources, loading, error, refresh: load, lastFetched };
 }

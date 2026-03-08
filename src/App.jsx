@@ -1,6 +1,10 @@
 import { useMemo, useState } from "react";
 import { useSheetData } from "./hooks/useSheetData";
-import { fmt, getYearMonth, formatYearMonth, byMonth, groupSum, teamName, serviceType, normalizeDate } from "./utils/finance";
+import {
+  fmt, getYear, getYearMonth, getISOWeek, normalizeDate,
+  formatYearMonth, formatWeek, formatDay,
+  byMonth, groupSum, teamName, serviceType, matchesPeriod,
+} from "./utils/finance";
 import LoadingScreen    from "./components/LoadingScreen";
 import ErrorScreen      from "./components/ErrorScreen";
 import KPICard          from "./components/KPICard";
@@ -13,19 +17,46 @@ import TopClients       from "./components/TopClients";
 import TransactionTable from "./components/TransactionTable";
 
 export default function App() {
-  const { transactions, loading, error, refresh, lastFetched } = useSheetData();
-  const [monthFilter, setMonthFilter] = useState("All");
+  const { transactions, loading, error, refresh, lastFetched, sheetSources } = useSheetData();
+  const [filterType,  setFilterType]  = useState("All");
+  const [filterValue, setFilterValue] = useState("");
 
-  // ── All months present in data ──────────────────────────────────────────────
-  const allMonths = useMemo(() =>
-    [...new Set(transactions.map(t => getYearMonth(t.transactionDate)).filter(Boolean))].sort(),
-    [transactions]
-  );
+  // ── Period options for dropdowns (always derived from all transactions) ─────
+  const periodOptions = useMemo(() => {
+    const years  = [...new Set(transactions.map(t => getYear(t.transactionDate)).filter(Boolean))].sort();
+    const months = [...new Set(transactions.map(t => getYearMonth(t.transactionDate)).filter(Boolean))].sort();
+    const weeks  = [...new Set(transactions.map(t => getISOWeek(t.transactionDate)).filter(Boolean))].sort();
+    const days   = [...new Set(transactions.map(t => normalizeDate(t.transactionDate)).filter(Boolean))].sort();
+    return { years, months, weeks, days };
+  }, [transactions]);
+
+  // Current value options for the second dropdown
+  const currentOptions = useMemo(() => {
+    switch (filterType) {
+      case "year":  return periodOptions.years.map(v => ({ value: v, label: v }));
+      case "month": return periodOptions.months.map(v => ({ value: v, label: formatYearMonth(v) }));
+      case "week":  return periodOptions.weeks.map(v => ({ value: v, label: formatWeek(v) }));
+      case "day":   return periodOptions.days.map(v => ({ value: v, label: formatDay(v) }));
+      default: return [];
+    }
+  }, [filterType, periodOptions]);
+
+  // Human-readable label for the active filter period
+  const periodLabel = useMemo(() => {
+    if (filterType === "All" || !filterValue) return "All time";
+    if (filterType === "year")  return filterValue;
+    if (filterType === "month") return formatYearMonth(filterValue);
+    if (filterType === "week")  return formatWeek(filterValue);
+    if (filterType === "day")   return formatDay(filterValue);
+    return "All time";
+  }, [filterType, filterValue]);
 
   // ── Filtered set ────────────────────────────────────────────────────────────
   const filtered = useMemo(() =>
-    monthFilter === "All" ? transactions : transactions.filter(t => getYearMonth(t.transactionDate) === monthFilter),
-    [transactions, monthFilter]
+    (filterType === "All" || !filterValue)
+      ? transactions
+      : transactions.filter(t => matchesPeriod(t.transactionDate, filterType, filterValue)),
+    [transactions, filterType, filterValue]
   );
 
   // ── KPIs ────────────────────────────────────────────────────────────────────
@@ -40,7 +71,7 @@ export default function App() {
   }, [filtered]);
 
   // ── Monthly chart ────────────────────────────────────────────────────────────
-  const monthlyData = useMemo(() => byMonth(transactions), [transactions]);
+  const monthlyData = useMemo(() => byMonth(filtered), [filtered]);
 
   // ── Revenue by category ──────────────────────────────────────────────────────
   const revByCat = useMemo(() =>
@@ -54,33 +85,34 @@ export default function App() {
     [filtered]
   );
 
-  // ── Team payments (all-time, unaffected by month filter) ────────────────────
+  // ── Team payments ───────────────────────────────────────────────────────────
   const teamData = useMemo(() =>
-    groupSum(transactions, t => teamName(t.description), t => t.category === "Labor"),
-    [transactions]
+    groupSum(filtered, t => teamName(t.description), t => t.category === "Labor"),
+    [filtered]
   );
 
   // ── Running balance ──────────────────────────────────────────────────────────
   const balanceData = useMemo(() =>
-    [...transactions]
+    [...filtered]
       .filter(t => t.balance && t.bankDate)
       .sort((a, b) => normalizeDate(a.bankDate).localeCompare(normalizeDate(b.bankDate)))
       .map(t => ({ label: t.bankDate, balance: t.balance })),
-    [transactions]
+    [filtered]
   );
 
   // ── Service type stacked chart ───────────────────────────────────────────────
   const serviceData = useMemo(() => {
+    const months = [...new Set(filtered.map(t => getYearMonth(t.transactionDate)).filter(Boolean))].sort();
     const monthMap = {};
-    allMonths.forEach(m => {
+    months.forEach(m => {
       monthMap[m] = { month: formatYearMonth(m), Build: 0, Consulting: 0, "Continued Support": 0, Other: 0 };
     });
-    transactions.filter(t => t.category === "Sales" && t.type === "Revenue").forEach(t => {
+    filtered.filter(t => t.category === "Sales" && t.type === "Revenue").forEach(t => {
       const m = getYearMonth(t.transactionDate);
       if (monthMap[m]) monthMap[m][serviceType(t.notes)] += Math.abs(t.amount);
     });
     return Object.values(monthMap);
-  }, [transactions, allMonths]);
+  }, [filtered]);
 
   // ── Top clients ──────────────────────────────────────────────────────────────
   const topClients = useMemo(() =>
@@ -101,6 +133,12 @@ export default function App() {
   if (loading) return <LoadingScreen />;
   if (error)   return <ErrorScreen error={error} onRetry={refresh} />;
 
+  const valueDropdownLabel =
+    filterType === "year"  ? "All Years"  :
+    filterType === "month" ? "All Months" :
+    filterType === "week"  ? "All Weeks"  :
+    filterType === "day"   ? "All Days"   : "";
+
   return (
     <div className="min-h-screen bg-gray-50">
       {/* ── Header ─────────────────────────────────────────────────────────── */}
@@ -109,20 +147,39 @@ export default function App() {
           <div className="flex-1 min-w-0">
             <h1 className="text-xl font-bold text-gray-900 leading-tight">Financial Dashboard</h1>
             <p className="text-xs text-gray-400 mt-0.5">
-              Live from Google Sheets · {transactions.length} transactions
+              Live from Google Sheets
+              {sheetSources.length > 1 && ` · ${sheetSources.length} tabs`}
+              {" · "}{transactions.length} transactions
               {lastFetched && ` · Updated ${lastFetched.toLocaleTimeString()}`}
             </p>
           </div>
           <div className="flex items-center gap-2">
             <label className="text-xs text-gray-500 font-medium whitespace-nowrap">Period:</label>
+            {/* Filter type selector */}
             <select
               className="border border-gray-200 rounded-lg px-3 py-1.5 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-indigo-200"
-              value={monthFilter}
-              onChange={e => setMonthFilter(e.target.value)}
+              value={filterType}
+              onChange={e => { setFilterType(e.target.value); setFilterValue(""); }}
             >
               <option value="All">All Time</option>
-              {allMonths.map(m => <option key={m} value={m}>{formatYearMonth(m)}</option>)}
+              <option value="year">Year</option>
+              <option value="month">Month</option>
+              <option value="week">Week</option>
+              <option value="day">Day</option>
             </select>
+            {/* Value selector — only shown when a filter type is active */}
+            {filterType !== "All" && (
+              <select
+                className="border border-gray-200 rounded-lg px-3 py-1.5 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-indigo-200"
+                value={filterValue}
+                onChange={e => setFilterValue(e.target.value)}
+              >
+                <option value="">{valueDropdownLabel}</option>
+                {currentOptions.map(opt => (
+                  <option key={opt.value} value={opt.value}>{opt.label}</option>
+                ))}
+              </select>
+            )}
             <button
               onClick={refresh}
               className="flex items-center gap-1.5 px-3 py-1.5 text-sm border border-gray-200 rounded-lg text-gray-600 hover:bg-gray-50 hover:border-gray-300 transition-colors"
@@ -142,7 +199,7 @@ export default function App() {
           <KPICard title="Total Expenses" value={fmt(kpis.expenses)} color="red"    icon="📉" />
           <KPICard title="Net Income"     value={fmt(kpis.net)}      subtitle={`${kpis.margin}% margin`}     color={kpis.net >= 0 ? "blue" : "red"} icon="💰" />
           <KPICard title="Bank Balance"   value={fmt(kpis.balance)}  subtitle="Latest balance"               color="purple" icon="🏦" />
-          <KPICard title="Transactions"   value={kpis.count}         subtitle={monthFilter === "All" ? "All time" : formatYearMonth(monthFilter)} color="amber" icon="📋" />
+          <KPICard title="Transactions"   value={kpis.count}         subtitle={periodLabel}                  color="amber"  icon="📋" />
         </div>
 
         {/* ── Monthly bar chart ────────────────────────────────────────────── */}
@@ -196,7 +253,9 @@ export default function App() {
         <TransactionTable transactions={filtered} />
 
         <footer className="text-center text-xs text-gray-300 pb-4">
-          Data pulled live from Google Sheets · Spreadsheet ID: {import.meta.env.VITE_SPREADSHEET_ID || "1N3D-jywleiBhsxByuK-Mq17sJpFIZYvo3Is4RmxkLkg"}
+          Data pulled live from Google Sheets
+          {sheetSources.length > 0 && ` · Tabs: ${sheetSources.map(s => s.name).join(", ")}`}
+          {" · "}Spreadsheet ID: {import.meta.env.VITE_SPREADSHEET_ID || "1N3D-jywleiBhsxByuK-Mq17sJpFIZYvo3Is4RmxkLkg"}
         </footer>
       </main>
     </div>
