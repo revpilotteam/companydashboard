@@ -15,6 +15,7 @@ import BalanceChart     from "./components/BalanceChart";
 import ServiceTypeChart from "./components/ServiceTypeChart";
 import TopClients       from "./components/TopClients";
 import TransactionTable from "./components/TransactionTable";
+import ChatBot         from "./components/ChatBot";
 
 export default function App() {
   const { transactions, loading, error, refresh, lastFetched, sheetSources } = useSheetData();
@@ -251,6 +252,13 @@ export default function App() {
 
         {/* ── Transaction table ────────────────────────────────────────────── */}
         <TransactionTable transactions={filtered} />
+
+        <ChatBot
+          transactions={filtered}
+          kpis={kpis}
+          streams={streams}
+          periodLabel={periodLabel}
+        />
 
         <footer className="text-center text-xs text-gray-300 pb-4">
           Data pulled live from Google Sheets
