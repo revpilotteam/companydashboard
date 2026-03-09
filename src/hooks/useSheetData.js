@@ -1,18 +1,13 @@
 import { useState, useEffect, useCallback } from "react";
-import { SPREADSHEET_ID, API_KEY, TX_GID, META_GID } from "../config";
+import { API_KEY, SPREADSHEETS } from "../config";
 
-const BASE = `https://sheets.googleapis.com/v4/spreadsheets/${SPREADSHEET_ID}`;
-
-// ── Helpers ──────────────────────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 async function apiFetch(url) {
   const res = await fetch(url);
   if (!res.ok) {
     let msg = `HTTP ${res.status}`;
-    try {
-      const json = await res.json();
-      msg = json?.error?.message || msg;
-    } catch (_) {}
+    try { const j = await res.json(); msg = j?.error?.message || msg; } catch (_) {}
     throw new Error(msg);
   }
   return res.json();
@@ -26,10 +21,7 @@ function rowsToObjects(rows) {
     .map(row => Object.fromEntries(headers.map((h, i) => [h, row[i] ?? ""])));
 }
 
-/**
- * Flexible key lookup — matches header names case-insensitively.
- * Returns the first value whose key contains any of the given substrings.
- */
+/** Flexible key lookup — matches header names case-insensitively. */
 function pick(obj, ...patterns) {
   const entries = Object.entries(obj);
   for (const pat of patterns) {
@@ -57,10 +49,6 @@ function parseTransaction(raw) {
   };
 }
 
-/**
- * More flexible parser for extra tabs with non-standard column names.
- * Handles common variations seen in master transaction and software payment sheets.
- */
 function parseExtraTransaction(raw, tabType) {
   const tx = {
     transactionDate: pick(raw, "transaction date", "trans date", "date", "payment date", "billing date", "renewal date"),
@@ -72,7 +60,6 @@ function parseExtraTransaction(raw, tabType) {
     balance:         parseAmount(pick(raw, "balance", "running balance")),
     notes:           pick(raw, "notes", "billing cycle", "frequency", "memo", "comment"),
   };
-  // Apply defaults based on tab classification
   if (tabType === "software") {
     if (!tx.type)     tx.type     = "Expense";
     if (!tx.category) tx.category = "Software";
@@ -80,116 +67,125 @@ function parseExtraTransaction(raw, tabType) {
   return tx;
 }
 
-/**
- * Classify a tab by its name. Returns "software", "master", or null.
- * Used to decide which extra tabs to load and how to parse them.
- */
 function classifyTab(name) {
   const lower = name.toLowerCase();
-  if (lower.includes("software") || lower.includes("saas")) return "software";
-  if (lower.includes("master") || lower.includes("all transaction")) return "master";
+  if (lower.includes("software") || lower.includes("saas"))          return "software";
+  if (lower.includes("master")   || lower.includes("all transaction")) return "master";
   return null;
 }
 
-// ── Hook ─────────────────────────────────────────────────────────────────────
+// ── Single-spreadsheet loader ─────────────────────────────────────────────────
+
+async function loadSpreadsheet({ id, txGid, label }) {
+  const base = `https://sheets.googleapis.com/v4/spreadsheets/${id}`;
+
+  // 1 — Resolve sheet names from GIDs
+  const metaJson = await apiFetch(
+    `${base}?key=${API_KEY}&fields=sheets.properties`
+  ).catch(e => {
+    throw new Error(
+      `[${label}] ${e.message}. Make sure the spreadsheet is shared as "Anyone with the link can view".`
+    );
+  });
+
+  const sheetsInfo = metaJson.sheets || [];
+  const gidMap = Object.fromEntries(
+    sheetsInfo.map(({ properties: p }) => [p.sheetId, p.title])
+  );
+
+  // Resolve primary tab — use GID if provided, otherwise first tab
+  const txSheetName = (txGid != null ? gidMap[txGid] : null)
+    ?? sheetsInfo[0]?.properties?.title;
+
+  if (!txSheetName) throw new Error(`[${label}] No sheets found.`);
+
+  // 2 — Fetch primary transaction sheet
+  const txData = await apiFetch(
+    `${base}/values/${encodeURIComponent(txSheetName)}?key=${API_KEY}&valueRenderOption=UNFORMATTED_VALUE&dateTimeRenderOption=FORMATTED_STRING`
+  );
+  const primaryTxs = rowsToObjects(txData.values || [])
+    .map(parseTransaction)
+    .filter(t => t.transactionDate && (t.amount !== 0 || t.type))
+    .map(t => ({ ...t, source: txSheetName, spreadsheet: label }));
+
+  // 3 — Load all remaining tabs as extra sources
+  const loadedNames = new Set([txSheetName]);
+  const extraSheets = sheetsInfo
+    .map(s => ({ name: s.properties?.title || "" }))
+    .filter(({ name }) => name && !loadedNames.has(name));
+
+  const extraResults = await Promise.allSettled(
+    extraSheets.map(async ({ name }) => {
+      const tabType = classifyTab(name);
+      const data = await apiFetch(
+        `${base}/values/${encodeURIComponent(name)}?key=${API_KEY}&valueRenderOption=UNFORMATTED_VALUE&dateTimeRenderOption=FORMATTED_STRING`
+      );
+      const sheetRows = data.values || [];
+      const txs = rowsToObjects(sheetRows)
+        .map(raw => ({ ...parseExtraTransaction(raw, tabType), source: name, spreadsheet: label }))
+        .filter(t => t.transactionDate && (t.amount !== 0 || t.type));
+      return { name, tabType, headers: sheetRows[0] || [], count: txs.length, transactions: txs };
+    })
+  );
+
+  const extraTxs = extraResults
+    .filter(r => r.status === "fulfilled")
+    .flatMap(r => r.value.transactions);
+
+  // 4 — Build source list for this spreadsheet
+  const sources = [
+    { name: txSheetName, spreadsheet: label, tabType: "primary", count: primaryTxs.length },
+    ...extraResults
+      .filter(r => r.status === "fulfilled")
+      .map(r => ({
+        name:        r.value.name,
+        spreadsheet: label,
+        tabType:     r.value.tabType,
+        count:       r.value.count,
+        headers:     r.value.headers,
+      })),
+  ];
+
+  return { transactions: [...primaryTxs, ...extraTxs], sources };
+}
+
+// ── Hook ──────────────────────────────────────────────────────────────────────
 
 export function useSheetData() {
-  const [transactions,  setTransactions]  = useState([]);
-  const [meta,          setMeta]          = useState([]);
-  const [sheetSources,  setSheetSources]  = useState([]);
-  const [loading,       setLoading]       = useState(true);
-  const [error,         setError]         = useState(null);
-  const [lastFetched,   setLastFetched]   = useState(null);
+  const [transactions, setTransactions] = useState([]);
+  const [meta,         setMeta]         = useState([]);
+  const [sheetSources, setSheetSources] = useState([]);
+  const [loading,      setLoading]      = useState(true);
+  const [error,        setError]        = useState(null);
+  const [lastFetched,  setLastFetched]  = useState(null);
 
   const load = useCallback(async () => {
     setLoading(true);
     setError(null);
-
     try {
-      // Step 1 — fetch spreadsheet metadata to resolve sheet names from GIDs
-      const metaJson = await apiFetch(
-        `${BASE}?key=${API_KEY}&fields=sheets.properties`
-      ).catch(e => {
-        throw new Error(
-          `${e.message}. Make sure the spreadsheet is shared as "Anyone with the link can view" and Google Sheets API is enabled in your Google Cloud project.`
-        );
-      });
-
-      const sheetsInfo = metaJson.sheets || [];
-      const gidMap = Object.fromEntries(
-        sheetsInfo.map(({ properties: p }) => [p.sheetId, p.title])
+      // Load all spreadsheets in parallel — failed ones are skipped, not fatal
+      const results = await Promise.allSettled(
+        SPREADSHEETS.map(cfg => loadSpreadsheet(cfg))
       );
 
-      // Resolve sheet names; fall back to first / second tab if GID not found
-      const txSheetName   = gidMap[TX_GID]   ?? sheetsInfo[0]?.properties?.title;
-      const metaSheetName = gidMap[META_GID]  ?? sheetsInfo[1]?.properties?.title;
-
-      if (!txSheetName) throw new Error("No sheets found in the spreadsheet.");
-
-      // Step 2 — fetch primary transaction sheet
-      const txData = await apiFetch(
-        `${BASE}/values/${encodeURIComponent(txSheetName)}?key=${API_KEY}&valueRenderOption=UNFORMATTED_VALUE&dateTimeRenderOption=FORMATTED_STRING`
-      );
-      const rows = txData.values || [];
-      const parsed = rowsToObjects(rows)
-        .map(parseTransaction)
-        .filter(t => t.transactionDate && (t.amount !== 0 || t.type));
-
-      // Step 3 — fetch second sheet (categories/summary) if it exists
-      if (metaSheetName && metaSheetName !== txSheetName) {
-        try {
-          const metaData = await apiFetch(
-            `${BASE}/values/${encodeURIComponent(metaSheetName)}?key=${API_KEY}&valueRenderOption=UNFORMATTED_VALUE`
-          );
-          setMeta(rowsToObjects(metaData.values || []));
-        } catch (_) {
-          // Non-critical — ignore if second sheet fails
-        }
-      }
-
-      // Step 4 — load ALL remaining tabs (every tab not already loaded as primary or meta)
-      const loadedNames = new Set([txSheetName, metaSheetName].filter(Boolean));
-      const extraSheets = sheetsInfo
-        .map(s => ({ name: s.properties?.title || "" }))
-        .filter(({ name }) => name && !loadedNames.has(name));
-
-      const extraResults = await Promise.allSettled(
-        extraSheets.map(async ({ name }) => {
-          const tabType = classifyTab(name);
-          const data = await apiFetch(
-            `${BASE}/values/${encodeURIComponent(name)}?key=${API_KEY}&valueRenderOption=UNFORMATTED_VALUE&dateTimeRenderOption=FORMATTED_STRING`
-          );
-          const sheetRows = data.values || [];
-          const headers = sheetRows[0] || [];
-          const txs = rowsToObjects(sheetRows)
-            .map(raw => ({ ...parseExtraTransaction(raw, tabType), source: name }))
-            .filter(t => t.transactionDate && (t.amount !== 0 || t.type));
-          return { name, tabType, headers, count: txs.length, transactions: txs };
-        })
-      );
-
-      const extraTxs = extraResults
+      const allTransactions = results
         .filter(r => r.status === "fulfilled")
         .flatMap(r => r.value.transactions);
 
-      // Build sources list for display in the UI
-      const sources = [
-        { name: txSheetName, tabType: "primary", count: parsed.length },
-        ...extraResults
-          .filter(r => r.status === "fulfilled")
-          .map(r => ({
-            name:     r.value.name,
-            tabType:  r.value.tabType,
-            count:    r.value.count,
-            headers:  r.value.headers,
-          })),
-      ];
+      const allSources = results
+        .filter(r => r.status === "fulfilled")
+        .flatMap(r => r.value.sources);
 
-      setTransactions([
-        ...parsed.map(t => ({ ...t, source: txSheetName })),
-        ...extraTxs,
-      ]);
-      setSheetSources(sources);
+      // Surface partial errors as a warning (non-fatal)
+      const failures = results
+        .filter(r => r.status === "rejected")
+        .map(r => r.reason?.message || "Unknown error");
+      if (failures.length && !allTransactions.length) {
+        throw new Error(failures.join(" | "));
+      }
+
+      setTransactions(allTransactions);
+      setSheetSources(allSources);
       setLastFetched(new Date());
     } catch (e) {
       setError(e.message);
