@@ -16,9 +16,11 @@ import ServiceTypeChart from "./components/ServiceTypeChart";
 import TopClients       from "./components/TopClients";
 import TransactionTable from "./components/TransactionTable";
 import ChatBot         from "./components/ChatBot";
+import ExpenseControl  from "./components/ExpenseControl";
 
 export default function App() {
   const { transactions, loading, error, refresh, lastFetched, sheetSources } = useSheetData();
+  const [activeTab,   setActiveTab]   = useState("overview");
   const [filterType,  setFilterType]  = useState("All");
   const [filterValue, setFilterValue] = useState("");
 
@@ -154,6 +156,25 @@ export default function App() {
               {lastFetched && ` · Updated ${lastFetched.toLocaleTimeString()}`}
             </p>
           </div>
+          {/* ── Tab navigation ── */}
+          <div className="flex items-center gap-1 bg-gray-100 rounded-lg p-1">
+            {[
+              { id: "overview", label: "Overview" },
+              { id: "expenses", label: "Expense Control" },
+            ].map(tab => (
+              <button
+                key={tab.id}
+                onClick={() => setActiveTab(tab.id)}
+                className={`px-4 py-1.5 text-sm font-medium rounded-md transition-colors ${
+                  activeTab === tab.id
+                    ? "bg-white text-gray-900 shadow-sm"
+                    : "text-gray-500 hover:text-gray-700"
+                }`}
+              >
+                {tab.label}
+              </button>
+            ))}
+          </div>
           <div className="flex items-center gap-2">
             <label className="text-xs text-gray-500 font-medium whitespace-nowrap">Period:</label>
             {/* Filter type selector */}
@@ -193,6 +214,14 @@ export default function App() {
       </header>
 
       <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-6">
+
+        {/* ── Expense Control tab ──────────────────────────────────────────── */}
+        {activeTab === "expenses" && (
+          <ExpenseControl transactions={filtered} />
+        )}
+
+        {/* ── Overview tab ────────────────────────────────────────────────── */}
+        {activeTab === "overview" && (<>
 
         {/* ── KPI cards ───────────────────────────────────────────────────── */}
         <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
@@ -259,6 +288,8 @@ export default function App() {
           streams={streams}
           periodLabel={periodLabel}
         />
+
+        </>)}
 
         <footer className="text-center text-xs text-gray-300 pb-4">
           Data pulled live from Google Sheets
