@@ -5,5 +5,5 @@ export const API_KEY        = import.meta.env.VITE_API_KEY        || "AIzaSyD2SA
 
 // Sheet GIDs — used to identify tabs by ID even if names change.
 // If GIDs don't match (e.g. a copied sheet), the app falls back to the first two tabs.
-export const TX_GID   = 1605407619; // primary transactions sheet (Transactions_2025)
-export const META_GID = 1682070851; // Expense Control summary sheet
+export const TX_GID   = 1682070851; // primary transactions sheet (gid=1682070851 in 1tI22r-...)
+export const META_GID = 1605407619; // secondary/summary sheet
